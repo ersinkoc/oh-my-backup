@@ -2,6 +2,10 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+- Add the MIT license to the repository, package metadata and subsequent distribution archives.
+
 ## 0.1.0 — 2026-11-03
 
 ### Added

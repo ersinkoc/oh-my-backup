@@ -51,3 +51,7 @@ The embedded executable icon contains nine sizes from 16 to 256 pixels. `assets/
 4. The Windows workflow validates the tag/version match and attaches the ZIP and SHA-256 checksum to a GitHub Release. Verify the hosted workflow before distributing it.
 
 Releases from this private repository inherit its access restrictions. Builds are unsigned.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

@@ -58,7 +58,7 @@ def main():
     checksum, name = (PACKAGE / "SHA256SUMS.txt").read_text().strip().split()
     assert name == ARCHIVE.name
     assert hashlib.sha256(ARCHIVE.read_bytes()).hexdigest() == checksum
-    expected = {"oh-my-backup.exe", "install.ps1", "README.md", "CHANGELOG.md", "hbsync.ico", "logo.svg"}
+    expected = {"oh-my-backup.exe", "install.ps1", "README.md", "CHANGELOG.md", "LICENSE", "hbsync.ico", "logo.svg"}
     with zipfile.ZipFile(ARCHIVE) as archive:
         files = [f for f in archive.infolist() if not f.is_dir()]
         assert {pathlib.PurePosixPath(f.filename).name for f in files} == expected

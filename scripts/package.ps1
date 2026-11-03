@@ -17,7 +17,7 @@ try {
     $app = Join-Path $out 'OhMyBackup'
     [IO.Directory]::CreateDirectory($app) | Out-Null
     Copy-Item -LiteralPath 'target/release/oh-my-backup.exe' -Destination $app -Force
-    Copy-Item -LiteralPath 'scripts/install.ps1','README.md','CHANGELOG.md','assets/hbsync.ico','assets/logo.svg' -Destination $app -Force
+    Copy-Item -LiteralPath 'scripts/install.ps1','README.md','CHANGELOG.md','LICENSE','assets/hbsync.ico','assets/logo.svg' -Destination $app -Force
     $zip = Join-Path $out "oh-my-backup-v$version-windows-x64.zip"
     Compress-Archive -LiteralPath $app -DestinationPath $zip -Force
     $sum = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()

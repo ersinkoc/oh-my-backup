@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.93"
 description = "Windows desktop backup synchronization over SSH"
 repository = "https://github.com/ersinkoc/oh-my-backup"
+license = "MIT"
 
 [profile.release]
 strip = true
