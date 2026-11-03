@@ -22,7 +22,7 @@ class RecursiveHelperTests(unittest.TestCase):
             self.assertEqual({f["name"] for f in files}, {"root.txt", "nested/deep/quoted ' name.txt"})
             self.assertTrue(all(isinstance(f["mtime_ns"], int) for f in files))
             self.assertEqual([f["name"] for f in HELPER.snapshot(directory, False)], ["root.txt"])
-            self.assertEqual(HELPER.safe_path(directory, "root.txt"), str(root / "root.txt"))
+            self.assertTrue(pathlib.Path(HELPER.safe_path(directory, "root.txt")).samefile(root / "root.txt"))
 
     def test_path_escape_and_nonregular_sources_are_rejected(self):
         with tempfile.TemporaryDirectory(prefix="omb-safe-path-") as directory:

@@ -11,6 +11,7 @@
 - `scripts/test-installed-update.ps1`: real v0.2.0 → v0.3.0 upgrade passed in an isolated fixed-layout installation, including installed-file hashes, manifest and previous-executable retention.
 - The installed production application was detected running, so its executable was not replaced. It can apply the published release through the in-app updater after transfers stop.
 - Repository visibility was verified and restored to private as requested. Hosted CI and the published/downloaded release remain separate verification gates.
+- The first hosted run exposed a test-only assumption that Windows short/long path spellings are identical. The helper-path assertion now compares filesystem identity with `samefile`; no production behavior changed.
 
 ## Version 0.2.0 — installation and self-update
 
