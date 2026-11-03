@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Oh My Backup — secure backup, continuous sync</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#102537"/>
+  <path d="M64 100V76Q64 52 88 52H156" fill="none" stroke="#48dfc0" stroke-width="16" stroke-linecap="round"/>
+  <path d="M144 32L172 52L144 72Z" fill="#48dfc0"/>
+  <path d="M192 156V180Q192 204 168 204H100" fill="none" stroke="#48dfc0" stroke-width="16" stroke-linecap="round"/>
+  <path d="M112 184L84 204L112 224Z" fill="#48dfc0"/>
+  <rect x="88" y="90" width="80" height="32" rx="8" fill="#eaf6fc"/>
+  <rect x="88" y="134" width="80" height="32" rx="8" fill="#eaf6fc"/>
+  <circle cx="152" cy="106" r="4" fill="#102537"/>
+  <circle cx="152" cy="150" r="4" fill="#102537"/>
+</svg>
