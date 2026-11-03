@@ -1,5 +1,17 @@
 # Desktop review and validation
 
+## Version 0.3.0 — profiles and generic folder rules
+
+- Debug and optimized Rust suites: 30 passed. Includes profile migration/isolation/archive retention, overlapping-root leases, rule glob/path validation, quiet periods and deletion scheduling, source identity/cache revisions, managed-only deletion, torn-journal replay, atomic replacement/version retention and damaged resume-block invalidation.
+- Offline egui render checks cover both profile types, Turkish/English and 900×500 / 1500×900 viewports, including the file rules editor. These checks establish rendering without a panic; they are not a native screenshot review.
+- Formatting and strict Clippy: passed. Python helper/privacy suites: 8 passed, including recursive/shallow scanning, quoted paths, link rejection and incomplete-scan failures.
+- Installer boundary tests: passed in Windows PowerShell 5.1 and PowerShell 7.
+- No live SSH transfer, destructive mirror operation on production data, bidirectional sync or application-consistent snapshot was tested. Existing production workers were not stopped or restarted.
+- `scripts/package.ps1` and `scripts/verify-package.py`: v0.3.0 ZIP contents, SHA-256, x64 executable, nine embedded icon resources, private build-path removal and `--version` startup passed.
+- `scripts/test-installed-update.ps1`: real v0.2.0 → v0.3.0 upgrade passed in an isolated fixed-layout installation, including installed-file hashes, manifest and previous-executable retention.
+- The installed production application was detected running, so its executable was not replaced. It can apply the published release through the in-app updater after transfers stop.
+- Repository visibility was verified and restored to private as requested. Hosted CI and the published/downloaded release remain separate verification gates.
+
 ## Version 0.2.0 — installation and self-update
 
 - `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`: passed.

@@ -269,9 +269,53 @@ impl Remote {
         Ok(serde_json::from_slice(&out)?)
     }
 
+    pub async fn tree(
+        &self,
+        root: &str,
+        recursive: bool,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<crate::generic::Snapshot> {
+        let mut out = Vec::new();
+        self.exec_stream(
+            &["tree", root, if recursive { "1" } else { "0" }],
+            None,
+            |data| {
+                if out.len() + data.len() > 64 * 1024 * 1024 {
+                    bail!("Source listing exceeds 64 MiB");
+                }
+                out.extend_from_slice(data);
+                Ok(())
+            },
+            cancel,
+        )
+        .await?;
+        Ok(serde_json::from_slice(&out)?)
+    }
+
+    pub async fn stat_file(
+        &self,
+        root: &str,
+        relative: &str,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<crate::generic::SourceFile>> {
+        let mut out = Vec::new();
+        self.exec_stream(
+            &["stat-safe", root, relative],
+            None,
+            |data| {
+                out.extend_from_slice(data);
+                Ok(())
+            },
+            cancel,
+        )
+        .await?;
+        Ok(serde_json::from_slice(&out)?)
+    }
+
     /// Block hashes of a remote file starting at block `start`, streamed to `sink` as they arrive.
     pub async fn hash(
         &self,
+        root: Option<&str>,
         path: &str,
         block: u64,
         start: u64,
@@ -280,8 +324,13 @@ impl Remote {
     ) -> Result<()> {
         let mut carry: Vec<u8> = Vec::new();
         let (bs, st) = (block.to_string(), start.to_string());
+        let args = if let Some(root) = root {
+            vec!["hash-safe", root, path, &bs, &st]
+        } else {
+            vec!["hash", path, &bs, &st]
+        };
         self.exec_stream(
-            &["hash", path, &bs, &st],
+            &args,
             None,
             |d| {
                 carry.extend_from_slice(d);
@@ -314,6 +363,7 @@ impl Remote {
     /// Stream the given byte ranges of a remote file, concatenated in order.
     pub async fn read_ranges(
         &self,
+        root: Option<&str>,
         path: &str,
         ranges: &[(u64, u64)],
         sink: impl FnMut(&[u8]) -> Result<()> + Send,
@@ -323,7 +373,12 @@ impl Remote {
         for (o, l) in ranges {
             req.push_str(&format!("{o} {l}\n"));
         }
-        self.exec_stream(&["read", path], Some(req.into_bytes()), sink, cancel)
+        let args = if let Some(root) = root {
+            vec!["read-safe", root, path]
+        } else {
+            vec!["read", path]
+        };
+        self.exec_stream(&args, Some(req.into_bytes()), sink, cancel)
             .await
     }
 

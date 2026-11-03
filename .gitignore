@@ -3,6 +3,8 @@
 .dfmt/
 /.claude/
 /.hbsync/
+**/.hbsync/
+*.profiles/
 /.temp_files/
 /dist/
 *.log

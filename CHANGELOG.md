@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
+## 0.3.0 — 2026-11-03
+
+- Add independent Files and Veeam profiles with isolated settings, credentials, logs, statistics and workers; preserve the existing Veeam profile in place.
+- Add recursive SSH folder monitoring, include/exclude glob rules, quiet periods, per-file scheduling, rules-only preset export, action preview and recent run history.
+- Stage generic file updates, verify resumed block content before publishing, replace atomically and retain previous versions.
+- Protect unmanaged and locally changed files by default; support keep, quarantine and explicit mirror deletion for managed files only.
+- Persist ownership through a replayable journal; scope transfer caches to source identities and nanosecond file revisions.
+- Reject overlapping destinations, links/junctions, unsafe Windows names, case collisions and incomplete source scans.
+- Coordinate shutdown and application updates across every profile; add a bilingual Files preview and virtualize dashboard rows.
+
 ## 0.2.0 — 2026-11-03
 
 - Add a self-contained root installer with a fixed per-user installation folder, stable shortcuts, an installation manifest and existing-startup migration.

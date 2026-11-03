@@ -3,9 +3,12 @@
 mod blk;
 mod config;
 mod desktop;
+mod generic;
 mod i18n;
 mod preview;
+mod profiles;
 mod remote;
+mod rules;
 mod schedule;
 mod stats;
 mod sync;
@@ -35,7 +38,8 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    let preview = args.iter().any(|arg| arg == "--preview");
+    let files_preview = args.iter().any(|arg| arg == "--preview-files");
+    let preview = files_preview || args.iter().any(|arg| arg == "--preview");
     // oh-my-backup.exe --set-password <pw>   (stores the password DPAPI-encrypted, then exits)
     if args.len() == 3 && args[1] == "--set-password" {
         let mut c = config::Config::load();
@@ -83,7 +87,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    let cfg = if preview {
+    let mut cfg = if preview {
         config::Config {
             auto_start: false,
             local_root: std::env::temp_dir()
@@ -95,24 +99,42 @@ fn main() -> eframe::Result {
     } else {
         config::Config::load()
     };
+    if !preview && !config::Config::path().exists() {
+        cfg.kind = rules::ProfileKind::Files;
+        cfg.mode = config::UpdateMode::Safe;
+        cfg.scan_interval_min = 1;
+    }
+    if files_preview {
+        cfg.kind = rules::ProfileKind::Files;
+        cfg.mode = config::UpdateMode::Safe;
+    }
     i18n::set_language(cfg.language);
     if !preview && !config::Config::path().exists() {
         let _ = cfg.save();
     }
     let ctl = sync::Control::new(cfg);
-    if preview {
-        preview::populate(&ctl);
+    let mut profile_error = None;
+    let mut hub = if preview {
+        profiles::Hub::single(ctl)
     } else {
-        sync::start_sampler(ctl.clone());
-        let c2 = ctl.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .expect("tokio");
-            rt.block_on(sync::engine(c2));
-        });
+        match profiles::Hub::load() {
+            Ok(hub) => hub,
+            Err(error) => {
+                profile_error = Some(format!(
+                    "Profile catalog: {error}. Profile management is disabled."
+                ));
+                profiles::Hub::single(ctl)
+            }
+        }
+    };
+    if preview {
+        if files_preview {
+            preview::populate_files(&hub.profiles[0].ctl);
+        } else {
+            preview::populate(&hub.profiles[0].ctl);
+        }
+    } else {
+        hub.start_all();
     }
 
     let opts = eframe::NativeOptions {
@@ -128,8 +150,11 @@ fn main() -> eframe::Result {
         opts,
         Box::new(move |cc| {
             ui::setup_fonts(&cc.egui_ctx);
-            *ctl.ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
-            Ok(Box::new(ui::App::new(ctl, preview)))
+            Ok(Box::new(ui::App::with_profiles(
+                hub,
+                preview,
+                profile_error,
+            )))
         }),
     )
 }

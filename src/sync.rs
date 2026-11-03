@@ -34,6 +34,8 @@ pub struct LocalFile {
 
 #[derive(Clone, Debug)]
 pub struct VmView {
+    pub file_action: Option<crate::generic::Action>,
+    pub file_reason: Option<String>,
     pub name: String,
     pub remote: Vec<RemoteFile>,
     pub remote_size: u64,
@@ -96,6 +98,10 @@ pub struct Shared {
 }
 
 pub struct Control {
+    pub profile_id: String,
+    pub leases: Option<Arc<crate::profiles::RootLeases>>,
+    pub data_path: PathBuf,
+    pub snapshot: Mutex<Option<crate::generic::Snapshot>>,
     pub shutdown: AtomicBool,
     pub engine_stopped: AtomicBool,
     pub sampler_stopped: AtomicBool,
@@ -124,8 +130,28 @@ pub struct Control {
 
 impl Control {
     pub fn new(cfg: Config) -> Arc<Control> {
+        Self::create(cfg, "standalone".into(), None)
+    }
+    pub fn new_scoped(
+        cfg: Config,
+        id: String,
+        leases: Arc<crate::profiles::RootLeases>,
+    ) -> Arc<Control> {
+        Self::create(cfg, id, Some(leases))
+    }
+    fn create(
+        cfg: Config,
+        profile_id: String,
+        leases: Option<Arc<crate::profiles::RootLeases>>,
+    ) -> Arc<Control> {
         let state = State::load(&cfg.local_root);
+        let stats = crate::stats::Stats::load_for(&cfg);
+        let data_path = cfg.save_path();
         Arc::new(Control {
+            profile_id,
+            leases,
+            data_path,
+            snapshot: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             engine_stopped: AtomicBool::new(false),
             sampler_stopped: AtomicBool::new(false),
@@ -140,7 +166,7 @@ impl Control {
             state: Mutex::new(state),
             shared: Mutex::new(Shared {
                 session_start: chrono::Utc::now().timestamp(),
-                stats: crate::stats::Stats::load(),
+                stats,
                 ..Default::default()
             }),
             ctx: Mutex::new(None),
@@ -174,7 +200,7 @@ impl Control {
         if self.once.load(Ordering::Relaxed) {
             println!("{line}");
         }
-        let dir = app_dir().join("logs");
+        let dir = self.logs_dir();
         let _ = fs::create_dir_all(&dir);
         let p = dir.join(format!(
             "hbsync-{}.log",
@@ -186,7 +212,7 @@ impl Control {
         self.repaint();
     }
 
-    fn set_activity(&self, a: Option<Activity>) {
+    pub(crate) fn set_activity(&self, a: Option<Activity>) {
         self.shared.lock().unwrap().activity = a;
         self.repaint();
     }
@@ -207,6 +233,19 @@ impl Control {
 
     pub fn wake(&self) {
         self.notify.notify_one();
+    }
+    pub fn claim_destination(&self, cfg: &Config) -> Result<()> {
+        if let Some(leases) = &self.leases {
+            leases.claim(&self.profile_id, Path::new(&cfg.local_root))?;
+        }
+        Ok(())
+    }
+    pub fn logs_dir(&self) -> PathBuf {
+        self.data_path
+            .parent()
+            .map(Path::to_owned)
+            .unwrap_or_else(app_dir)
+            .join("logs")
     }
 
     /// Start a dir by hand: clears snooze/back-off and makes it the next job.
@@ -527,6 +566,8 @@ fn refresh_views(ctl: &Control, cfg: &Config, l: &RemoteListing) {
             )
         };
         vms.push(VmView {
+            file_action: None,
+            file_reason: None,
             name: d.name.clone(),
             remote_size: d.files.iter().map(|f| f.size).sum(),
             remote: d.files.clone(),
@@ -797,6 +838,9 @@ fn recover_trash(ctl: &Control, cfg: &Config) {
 struct EngineExit(Arc<Control>);
 impl Drop for EngineExit {
     fn drop(&mut self) {
+        if let Some(leases) = &self.0.leases {
+            leases.release(&self.0.profile_id);
+        }
         self.0.engine_stopped.store(true, Ordering::SeqCst);
         self.0.repaint();
     }
@@ -805,6 +849,10 @@ impl Drop for EngineExit {
 pub async fn engine(ctl: Arc<Control>) {
     let _exit = EngineExit(ctl.clone());
     if ctl.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    if ctl.config.lock().unwrap().kind == crate::rules::ProfileKind::Files {
+        crate::generic::engine(&ctl).await;
         return;
     }
     let mut remote: Option<Arc<Remote>> = None;
@@ -822,6 +870,15 @@ pub async fn engine(ctl: Arc<Control>) {
                 format!("Ayarlar geçersiz: {e}"),
                 format!("Invalid settings: {e}"),
             );
+            ctl.repaint();
+            if ctl.once.load(Ordering::SeqCst) {
+                return;
+            }
+            wait_cmd(&ctl, Duration::from_secs(30)).await;
+            continue;
+        }
+        if let Err(error) = ctl.claim_destination(&cfg) {
+            ctl.shared.lock().unwrap().waiting = error.to_string();
             ctl.repaint();
             if ctl.once.load(Ordering::SeqCst) {
                 return;
@@ -1112,11 +1169,17 @@ struct Env<'a> {
     r: Arc<Remote>,
     stop: Arc<AtomicU8>,
     name: &'a str,
+    forced: bool,
 }
 
 impl Env<'_> {
     fn stopped(&self) -> bool {
-        self.ctl.shutdown.load(Ordering::SeqCst) || self.stop.load(Ordering::SeqCst) != STOP_NONE
+        self.ctl.shutdown.load(Ordering::SeqCst)
+            || self.ctl.cancel.load(Ordering::SeqCst)
+            || self.stop.load(Ordering::SeqCst) != STOP_NONE
+            || (self.cfg.kind == crate::rules::ProfileKind::Files
+                && !self.forced
+                && !self.ctl.running.load(Ordering::SeqCst))
     }
     fn check(&self) -> Result<()> {
         if self.stopped() {
@@ -1213,6 +1276,7 @@ async fn sync_vm(ctl: &Arc<Control>, cfg: &Config, r: Arc<Remote>, name: &str) -
         r,
         stop: stop.clone(),
         name,
+        forced: false,
     };
     match sync_passes(&env).await {
         Err(e) if e.is::<Cancelled>() => Ok(Outcome::Interrupted(
@@ -1285,12 +1349,13 @@ fn resumable(tgt: &Path, side_p: &Path, f: &RemoteFile) -> bool {
 async fn remote_hashes(
     ctl: &Control,
     r: &Remote,
-    rpath: &str,
+    address: (Option<&str>, &str),
     f: &RemoteFile,
     rh_p: &Path,
     mut progress: impl FnMut(u64) + Send,
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<BlockHash>> {
+    let (root, rpath) = address;
     let total = block_count(f.size, BLOCK);
     let mut b = Blk::load(rh_p)
         .ok()
@@ -1321,6 +1386,7 @@ async fn remote_hashes(
     let mut last_save = Instant::now();
     let res = r
         .hash(
+            root,
             rpath,
             BLOCK,
             k as u64,
@@ -1386,7 +1452,7 @@ fn spawn_hash(env: &Env<'_>, rpath: String, f: RemoteFile, rh_p: PathBuf) -> Has
         let res = remote_hashes(
             &ctl,
             &r,
-            &rpath,
+            (None, &rpath),
             &f,
             &rh_p,
             |done| {
@@ -1794,12 +1860,17 @@ async fn transfer(
     pre: Option<HashTask>,
 ) -> Result<bool> {
     let (ctl, cfg, name) = (env.ctl, env.cfg, env.name);
-    let rpath = format!(
-        "{}/{}/{}",
-        cfg.remote_root.trim_end_matches('/'),
-        name,
-        f.name
-    );
+    let root = (cfg.kind == crate::rules::ProfileKind::Files).then_some(cfg.remote_root.as_str());
+    let rpath = if root.is_some() {
+        f.name.clone()
+    } else {
+        format!(
+            "{}/{}/{}",
+            cfg.remote_root.trim_end_matches('/'),
+            name,
+            f.name
+        )
+    };
 
     // Never write through a hard link (it would modify the live copy as well).
     if tgt.exists() && link_count(tgt)? > 1 {
@@ -1892,7 +1963,7 @@ async fn transfer(
                     remote_hashes(
                         ctl,
                         &env.r,
-                        &rpath,
+                        (root, &rpath),
                         f,
                         &rh_p,
                         |done| {
@@ -1961,6 +2032,11 @@ async fn transfer(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        let bname = if root.is_some() {
+            f.name.clone()
+        } else {
+            bname
+        };
         let bblk = match load_blk_for(b, &p.comblk.join(blk_name(&bname))) {
             Some(x) => x,
             None => hash_local(env, b, "kaynak")?,
@@ -2050,6 +2126,7 @@ async fn transfer(
         let res = env
             .r
             .read_ranges(
+                root,
                 &rpath,
                 &ranges,
                 |mut data: &[u8]| {
@@ -2196,6 +2273,87 @@ fn link_count(p: &Path) -> Result<u32> {
     }
 }
 
+/// Reuse the verified block transfer without Veeam renaming or in-place mutation.
+pub(crate) async fn transfer_file(
+    ctl: &Arc<Control>,
+    cfg: &Config,
+    r: Arc<Remote>,
+    f: &RemoteFile,
+    forced: bool,
+) -> Result<(PathBuf, PathBuf)> {
+    let meta = crate::generic::cache_dir(cfg);
+    let p = Paths {
+        root: PathBuf::from(&cfg.local_root),
+        live: PathBuf::from(&cfg.local_root),
+        staging: meta.join("staging"),
+        stblk: meta.join("staging-blk"),
+        manifest: meta.join("unused.json"),
+        comblk: meta.join("blk"),
+        rhash: meta.join("rhash"),
+    };
+    crate::rules::validate_relative(&f.name)?;
+    for directory in [&p.staging, &p.stblk, &p.comblk, &p.rhash] {
+        crate::rules::plain_path(directory)?;
+        fs::create_dir_all(directory)?;
+    }
+    let target = crate::rules::target(&p.staging, &f.name)?;
+    fs::create_dir_all(target.parent().unwrap())?;
+    let side = crate::rules::target(&p.stblk, &blk_name(&f.name))?;
+    let base = crate::rules::target(&p.live, &f.name)?;
+    let base = (f.size >= DELTA_MIN && base.is_file()).then_some(base);
+    let env = Env {
+        ctl,
+        cfg,
+        r,
+        stop: Arc::new(AtomicU8::new(STOP_NONE)),
+        name: &f.name,
+        forced,
+    };
+    if !transfer(&env, &p, f, &target, &side, base, None).await? {
+        bail!("Source changed during transfer");
+    }
+    env.check()?;
+    verify_staged(&target, &side, f, || env.check())?;
+    Ok((target, side))
+}
+
+/// Re-read resumed blocks before publication. Invalidate damaged blocks for the next retry.
+fn verify_staged(
+    target: &Path,
+    side: &Path,
+    version: &RemoteFile,
+    check: impl Fn() -> Result<()>,
+) -> Result<()> {
+    let mut blocks = Blk::load(side)?;
+    if blocks.block != BLOCK
+        || blocks.remote_size != version.size
+        || blocks.remote_mtime != version.mtime
+        || !blocks.complete()
+    {
+        bail!("Incomplete staged revision");
+    }
+    let file = File::open(target)?;
+    if file.metadata()?.len() != version.size {
+        bail!("Staged file size changed");
+    }
+    let mut buf = vec![0; blocks.block as usize];
+    let mut damaged = false;
+    for i in 0..blocks.hashes.len() {
+        check()?;
+        let n = blocks.block_len(i) as usize;
+        file.seek_read_exact(&mut buf[..n], i as u64 * blocks.block)?;
+        if hash_block(&buf[..n]) != blocks.hashes[i] {
+            blocks.hashes[i] = ZERO;
+            damaged = true;
+        }
+    }
+    if damaged {
+        blocks.save(side)?;
+        bail!("Staged content failed verification; damaged blocks will be downloaded again");
+    }
+    Ok(())
+}
+
 trait PosIo {
     fn seek_read_exact(&self, buf: &mut [u8], off: u64) -> std::io::Result<()>;
     fn seek_write_all(&self, buf: &[u8], off: u64) -> std::io::Result<()>;
@@ -2229,6 +2387,28 @@ impl PosIo for File {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_verification_invalidates_corrupt_resume_blocks() {
+        let dir = std::env::temp_dir().join(format!("omb-resume-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let side = dir.join("data.blk");
+        fs::write(&data, b"valid").unwrap();
+        let version = RemoteFile {
+            name: "data".into(),
+            size: 5,
+            mtime: 123,
+        };
+        let mut blocks = Blk::new(5, 123);
+        blocks.hashes[0] = hash_block(b"valid");
+        blocks.save(&side).unwrap();
+        verify_staged(&data, &side, &version, || Ok(())).unwrap();
+        assert!(verify_staged(&data, &side, &version, || anyhow::bail!("cancelled")).is_err());
+        fs::write(&data, b"wrong").unwrap();
+        assert!(verify_staged(&data, &side, &version, || Ok(())).is_err());
+        assert_eq!(Blk::load(&side).unwrap().hashes[0], ZERO);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[tokio::test]
     async fn shutdown_before_start_acknowledges_without_network_or_recovery() {
         let ctl = Control::new(Config::default());

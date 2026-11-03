@@ -1,5 +1,6 @@
 use crate::config::{Config, Plan, UpdateMode, WEEKDAYS};
 use crate::i18n;
+use crate::rules::ProfileKind;
 use crate::schedule::{self, fmt_time};
 use crate::sync::{Activity, Control, VmView, dur_h, human};
 use chrono::{Local, TimeZone, Timelike};
@@ -20,6 +21,14 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct App {
     ctl: Arc<Control>,
+    hub: crate::profiles::Hub,
+    primary: Arc<Control>,
+    profiles_open: bool,
+    profile_name: String,
+    new_kind: crate::rules::ProfileKind,
+    rename_profile: String,
+    pending_archive: Option<String>,
+    rules_draft: Option<RulesDraft>,
     selected: Option<String>,
     settings: Option<Draft>,
     confirm_approve_all: bool,
@@ -39,6 +48,15 @@ pub struct App {
     update_open: bool,
     update_token: String,
     update_pending: Option<crate::update::Prepared>,
+}
+
+struct RulesDraft {
+    rules: crate::rules::FileRules,
+    includes: String,
+    excludes: String,
+    delete_confirmed: bool,
+    error: Option<String>,
+    preview: Vec<crate::generic::Item>,
 }
 
 /// Settings being edited (applied only on "Kaydet").
@@ -133,6 +151,14 @@ pub fn setup_fonts(ctx: &egui::Context) {
 impl App {
     pub fn new(ctl: Arc<Control>, preview: bool) -> App {
         App {
+            primary: ctl.clone(),
+            hub: crate::profiles::Hub::single(ctl.clone()),
+            profiles_open: false,
+            profile_name: String::new(),
+            new_kind: crate::rules::ProfileKind::Files,
+            rename_profile: String::new(),
+            pending_archive: None,
+            rules_draft: None,
             ctl,
             selected: None,
             settings: None,
@@ -154,6 +180,36 @@ impl App {
             update_token: String::new(),
             update_pending: None,
         }
+    }
+    pub fn with_profiles(hub: crate::profiles::Hub, preview: bool, notice: Option<String>) -> App {
+        let mut app = Self::new(hub.profiles[hub.selected].ctl.clone(), preview);
+        app.primary = hub.profiles[0].ctl.clone();
+        app.hub = hub;
+        app.notice = notice;
+        app
+    }
+    fn select_profile(&mut self, index: usize) {
+        if let Err(error) = self.hub.select(index) {
+            self.notice = Some(error.to_string());
+            return;
+        }
+        self.ctl = self.hub.profiles[index].ctl.clone();
+        self.selected = None;
+        self.search.clear();
+        self.filter = Filter::All;
+        self.last_title.clear();
+    }
+    fn save_language(&mut self, language: crate::i18n::Language) {
+        let mut config = self.primary.config.lock().unwrap();
+        let mut next = config.clone();
+        next.language = language;
+        if !self.preview
+            && let Err(error) = next.save()
+        {
+            self.notice = Some(error.to_string());
+            return;
+        }
+        *config = next;
     }
 
     fn log(&self, message: impl AsRef<str>) {
@@ -281,6 +337,23 @@ fn next_info(v: &VmView, now: i64, active: bool, weak: Color32) -> (i64, String,
             ),
         );
     }
+    if let Some(action) = v.file_action {
+        let reason = i18n::display(v.file_reason.as_deref().unwrap_or(""));
+        return (
+            if action == crate::generic::Action::Copy {
+                now
+            } else {
+                i64::MAX
+            },
+            action.label().into(),
+            if action == crate::generic::Action::Current {
+                GREEN
+            } else {
+                AMBER
+            },
+            reason,
+        );
+    }
     match v.due_at {
         None if !v.incomplete => (i64::MAX - 1, i18n::text("elle").into(), weak, plan),
         Some(u) if u > now && !v.incomplete => {
@@ -388,7 +461,9 @@ fn validate(c: &Config) -> Result<(), String> {
 impl eframe::App for App {
     fn on_exit(&mut self) {
         if !self.preview {
-            self.ctl.shared.lock().unwrap().stats.save();
+            for profile in &self.hub.profiles {
+                profile.ctl.shared.lock().unwrap().stats.save();
+            }
         }
     }
 
@@ -400,12 +475,35 @@ impl eframe::App for App {
 impl App {
     fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        for profile in &self.hub.profiles {
+            let mut current = profile.ctl.ctx.lock().unwrap();
+            if current.is_none() {
+                *current = Some(ctx.clone());
+            }
+        }
+        if let Some(id) = self.pending_archive.clone()
+            && self
+                .hub
+                .profiles
+                .iter()
+                .find(|p| p.entry.id == id)
+                .is_some_and(|p| {
+                    !p.started
+                        || (p.ctl.engine_stopped.load(Ordering::SeqCst)
+                            && p.ctl.sampler_stopped.load(Ordering::SeqCst))
+                })
+        {
+            if let Err(error) = self.hub.archive(&id) {
+                self.notice = Some(error.to_string());
+            }
+            self.ctl = self.hub.profiles[self.hub.selected].ctl.clone();
+            self.selected = None;
+            self.pending_archive = None;
+        }
         self.updater.poll();
         if let Some(package) = self.update_pending.clone() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.ctl.engine_stopped.load(Ordering::SeqCst)
-                && self.ctl.sampler_stopped.load(Ordering::SeqCst)
-            {
+            if self.hub.stopped() {
                 match self.updater.launch_apply(&package) {
                     Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Err(error) => {
@@ -451,16 +549,22 @@ impl App {
                 net,
             )
         };
-        let cfg = ctl.config.lock().unwrap().clone();
+        let mut cfg = ctl.config.lock().unwrap().clone();
+        cfg.language = self.primary.config.lock().unwrap().language;
         i18n::set_language(cfg.language);
         let running = ctl.running.load(Ordering::SeqCst);
-        if ctx.input(|i| i.viewport().close_requested()) && act.is_some() && !self.preview {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.hub.stopped() && !self.preview {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if !self.closing {
-                self.confirm_exit = true;
+                if self.hub.busy() {
+                    self.confirm_exit = true;
+                } else {
+                    self.hub.request_shutdown();
+                    self.closing = true;
+                }
             }
         }
-        if self.closing && act.is_none() {
+        if self.closing && self.hub.stopped() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         let now = chrono::Utc::now().timestamp();
@@ -486,6 +590,22 @@ impl App {
         // ------------------------------------------------ top
         egui::Panel::top("top").show_inside(ui, |ui| {
             ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let can_switch = self.settings.is_none() && self.rules_draft.is_none() && self.update_pending.is_none() && self.pending_archive.is_none();
+                let mut selected = self.hub.selected;
+                ui.add_enabled_ui(can_switch, |ui| {
+                    egui::ComboBox::from_id_salt("profile-selector").width(200.0).selected_text(&self.hub.profiles[selected].entry.name).show_ui(ui, |ui| {
+                        for (index, profile) in self.hub.profiles.iter().enumerate() { ui.selectable_value(&mut selected, index, &profile.entry.name); }
+                    });
+                    if ui.button(i18n::choose("Profiller", "Profiles")).clicked() { self.rename_profile = self.hub.profiles[self.hub.selected].entry.name.clone(); self.profiles_open = true; }
+                });
+                if selected != self.hub.selected { self.select_profile(selected); ctx.request_repaint(); }
+                ui.label(match cfg.kind { crate::rules::ProfileKind::Veeam => "Veeam", crate::rules::ProfileKind::Files => i18n::choose("Dosya otomasyonu", "File automation") });
+                if cfg.kind == crate::rules::ProfileKind::Files && ui.add_enabled(self.settings.is_none() && self.update_pending.is_none(), egui::Button::new(i18n::choose("Kurallar ve önizleme", "Rules and preview"))).clicked() {
+                    self.rules_draft = Some(RulesDraft { rules: cfg.rules.clone(), includes: cfg.rules.include.join("\n"), excludes: cfg.rules.exclude.join("\n"), delete_confirmed: cfg.rules.deletion == crate::rules::Deletion::Mirror, error: None, preview: Vec::new() });
+                }
+                ui.label(format!("{} {}", self.hub.profiles.len(), i18n::choose("profil", "profiles")));
+            });
             ui.horizontal_wrapped(|ui| {
                 if let Some(logo) = &self.logo { ui.image((logo.id(), vec2(44.0, 44.0))); }
                 ui.vertical(|ui| {
@@ -543,10 +663,10 @@ impl App {
                     ui.selectable_value(&mut language, crate::i18n::Language::English, "English");
                 });
                 if language != cfg.language {
-                    self.save_cfg(|c| c.language = language);
+                    self.save_language(language);
                     ctx.request_repaint();
                 }
-                if ui.button(i18n::text("⚙ Ayarlar")).clicked() {
+                if ui.add_enabled(self.rules_draft.is_none() && self.update_pending.is_none(), egui::Button::new(i18n::text("⚙ Ayarlar"))).clicked() {
                     let a = !self.preview && autostart_enabled();
                     self.settings = Some(Draft { cfg: cfg.clone(), pw: String::new(), autostart: a, autostart_orig: a, err: None });
                 }
@@ -648,7 +768,7 @@ impl App {
                     }
                     if ui.small_button(i18n::text("Log klasörü")).clicked() {
                         let _ = std::process::Command::new("explorer")
-                            .arg(crate::config::app_dir().join("logs"))
+                            .arg(self.ctl.logs_dir())
                             .spawn();
                     }
                 });
@@ -730,7 +850,7 @@ impl App {
         egui::CentralPanel::default_margins().show_inside(ui, |ui| {
             let total_remote: u64 = vms.iter().map(|v| v.remote_size).sum();
             ui.horizontal_wrapped(|ui| {
-                ui.strong(i18n::choose(format!("Sunucudaki yedekler: {}  ({} güncel / {})", human(total_remote), n_sync, vms.len()), format!("Server backups: {}  ({} up to date / {})", human(total_remote), n_sync, vms.len())));
+                ui.strong(i18n::choose(format!("{}: {}  ({} güncel / {})", if cfg.kind == ProfileKind::Files { "Kaynak dosyaları" } else { "Sunucudaki yedekler" }, human(total_remote), n_sync, vms.len()), format!("{}: {}  ({} up to date / {})", if cfg.kind == ProfileKind::Files { "Source files" } else { "Server backups" }, human(total_remote), n_sync, vms.len())));
                 let unapproved = vms.iter().filter(|v| !v.legacy.is_empty()).any(|v| {
                     let ap = cfg.legacy_approved.get(&v.name).cloned().unwrap_or_default();
                     v.legacy.iter().any(|(n, _)| !ap.contains(n))
@@ -812,7 +932,7 @@ impl App {
                     let cols = [
                         (i18n::text("Sunucu dizini"), SortCol::Name, i18n::text("Ada göre")),
                         (i18n::text("Sunucu"), SortCol::Remote, i18n::text("Sunucudaki toplam boyut")),
-                        (i18n::text("Son yedek"), SortCol::Last, i18n::text("Sunucudaki en yeni dosyanın zamanı")),
+                        (if cfg.kind == ProfileKind::Files { i18n::choose("Son değişiklik", "Last modified") } else { i18n::text("Son yedek") }, SortCol::Last, i18n::text("Sunucudaki en yeni dosyanın zamanı")),
                         (i18n::text("Job saati"), SortCol::Job, i18n::text("En yakın job önce")),
                         (i18n::text("Yerel"), SortCol::Local, i18n::text("Yerel diskteki boyut")),
                         (i18n::text("İlerleme"), SortCol::Progress, i18n::text("Güncel olma oranı (indirilmeyenlerde tahmini)")),
@@ -837,11 +957,11 @@ impl App {
                         });
                     }
                 })
-                .body(|mut body| {
-                    for &i in &order {
-                        let v = &vms[i];
-                        let active = act.as_ref().is_some_and(|a| a.vm == v.name);
-                        body.row(34.0, |mut row| {
+                .body(|body| {
+                        body.rows(34.0, order.len(), |mut row| {
+                            let i = order[row.index()];
+                            let v = &vms[i];
+                            let active = act.as_ref().is_some_and(|a| a.vm == v.name);
                             row.set_selected(self.selected.as_deref() == Some(v.name.as_str()));
                             row.col(|ui| {
                                 let mut t = RichText::new(&v.name);
@@ -918,6 +1038,8 @@ impl App {
                                     (act.as_ref().map(|a| format!("⇣ {} {:.0}%", i18n::display(&a.phase), pct(a.done, a.total) * 100.0)).unwrap_or_default(), BLUE)
                                 } else if v.last_error.is_some() && !v.in_sync {
                                     (format!("✖ {}", i18n::display(v.last_error.as_deref().unwrap_or_default())), RED)
+                                } else if let Some(action) = v.file_action {
+                                    (format!("{} · {}", action.label(), i18n::display(v.file_reason.as_deref().unwrap_or(""))), if action == crate::generic::Action::Current { GREEN } else { AMBER })
                                 } else if v.in_sync {
                                     (i18n::display(&v.status), GREEN)
                                 } else if v.excluded || matches!(v.plan, Plan::Manual) || v.due_at.is_some_and(|u| u > now) {
@@ -935,7 +1057,6 @@ impl App {
                                 self.selected = Some(v.name.clone());
                             }
                         });
-                    }
                 });
             });
             self.sort = sort;
@@ -974,9 +1095,7 @@ impl App {
                 ui.label(i18n::text("Çıkmadan önce aktarım durdurulup ilerleme kaydedilecek. Bir sonraki açılışta kaldığınız yerden devam edebilirsiniz."));
                 ui.horizontal(|ui| {
                     if ui.button(i18n::text("Aktarımı durdur ve çık")).clicked() {
-                        ctl.running.store(false, Ordering::SeqCst);
-                        ctl.cancel.store(true, Ordering::SeqCst);
-                        ctl.wake();
+                        self.hub.request_shutdown();
                         self.closing = true;
                         self.confirm_exit = false;
                     }
@@ -994,7 +1113,9 @@ impl App {
                 });
         }
         self.settings_window(&ctx, act.is_some());
-        self.update_window(&ctx, act.is_some());
+        self.update_window(&ctx, self.hub.busy());
+        self.profiles_window(&ctx);
+        self.rules_window(&ctx);
     }
 }
 
@@ -1614,7 +1735,7 @@ impl App {
         }
         ui.add_space(4.0);
         coverage_bar(ui, vms, act);
-        if !compact {
+        if !compact && cfg.kind == crate::rules::ProfileKind::Veeam {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -1669,8 +1790,10 @@ impl App {
                     }
                 });
             }
-            if ui.button(i18n::text("📂 Klasörü aç")).clicked() {
-                let _ = std::process::Command::new("explorer").arg(std::path::Path::new(&cfg.local_root).join(&v.name)).spawn();
+            if ui.button(i18n::text("📂 Klasörü aç")).clicked()
+                && let Ok(path) = crate::rules::target(std::path::Path::new(&cfg.local_root), &v.name) {
+                    let folder = if cfg.kind == ProfileKind::Files { path.parent().unwrap_or(&path) } else { &path };
+                    let _ = std::process::Command::new("explorer").arg(folder).spawn();
             }
         });
         if let Some(j) = &v.job {
@@ -1798,6 +1921,9 @@ impl App {
             });
 
         ui.separator();
+        if cfg.kind == crate::rules::ProfileKind::Files {
+            return;
+        }
         ui.strong(i18n::text(
             "Eski yerel dizinler (aynı sunucu, eski isimlendirme)",
         ));
@@ -1930,7 +2056,7 @@ impl App {
                     ui.end_row();
                     ui.label(i18n::text("Güncelleme modu"));
                     ui.vertical(|ui| {
-                        ui.radio_value(&mut c.mode, UpdateMode::InPlace, i18n::text("Yerinde: .vbk'de sadece değişen bloklar yazılır (hızlı, USB diski yormaz)"));
+                        ui.add_enabled_ui(c.kind == crate::rules::ProfileKind::Veeam, |ui| { ui.radio_value(&mut c.mode, UpdateMode::InPlace, i18n::text("Yerinde: .vbk'de sadece değişen bloklar yazılır (hızlı, USB diski yormaz)")); });
                         ui.radio_value(&mut c.mode, UpdateMode::Safe, i18n::text("Güvenli: yeni set tam kopya olarak hazırlanır, eski set sona kadar sağlam kalır (2× yer, çok yazma)"));
                     });
                     ui.end_row();
@@ -1973,6 +2099,7 @@ impl App {
                 newc.set_password(&d.pw);
             }
             let old = self.ctl.config.lock().unwrap().clone();
+            newc.github_token_enc = old.github_token_enc.clone();
             let reconnect = old.host != newc.host
                 || old.port != newc.port
                 || old.user != newc.user
@@ -1980,6 +2107,14 @@ impl App {
                 || old.host_fingerprint != newc.host_fingerprint;
             let roots_changed =
                 old.local_root != newc.local_root || old.remote_root != newc.remote_root;
+            if roots_changed
+                && let Err(error) = self
+                    .hub
+                    .validate_target(self.hub.selected, &newc.local_root)
+            {
+                d.err = Some(error.to_string());
+                return;
+            }
             if let Err(e) = newc.save() {
                 d.err = Some(i18n::choose(
                     format!("Kaydedilemedi: {e:#}"),
@@ -1995,7 +2130,9 @@ impl App {
                     format!("Settings saved; Windows startup could not be changed: {e}"),
                 ));
             }
+            let language = newc.language;
             *self.ctl.config.lock().unwrap() = newc;
+            self.save_language(language);
             if roots_changed && busy {
                 // the running job works on the old paths: stop it, it continues on the new ones
                 self.ctl.cancel.store(true, Ordering::SeqCst);
@@ -2027,6 +2164,149 @@ fn autostart_enabled() -> bool {
 }
 
 impl App {
+    fn profiles_window(&mut self, ctx: &egui::Context) {
+        if !self.profiles_open {
+            return;
+        }
+        if self.settings.is_some() || self.rules_draft.is_some() {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        let entries = self
+            .hub
+            .profiles
+            .iter()
+            .map(|p| p.entry.clone())
+            .collect::<Vec<_>>();
+        egui::Window::new(i18n::choose("Senkron profilleri", "Sync profiles")).open(&mut open).default_width(500.0).show(ctx, |ui| {
+            ui.label(i18n::choose("Her profilin bağlantısı, hedefi ve kayıtları bağımsızdır.", "Each profile has its own connection, destination and state."));
+            for (index, entry) in entries.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.strong(&entry.name);
+                    ui.label(if entry.kind == crate::rules::ProfileKind::Veeam { "Veeam" } else { i18n::choose("Dosyalar", "Files") });
+                    if ui.add_enabled(self.pending_archive.is_none(), egui::Button::new(i18n::choose("Seç", "Select"))).clicked() { self.select_profile(index); self.rename_profile = entry.name.clone(); }
+                });
+            }
+            ui.separator();
+            ui.label(i18n::choose("Seçili profilin adı", "Selected profile name"));
+            ui.text_edit_singleline(&mut self.rename_profile);
+            if ui.add_enabled(!self.preview && self.pending_archive.is_none(), egui::Button::new(i18n::choose("Adı kaydet", "Save name"))).clicked()
+                && let Err(error) = self.hub.rename(self.hub.selected, &self.rename_profile) { self.notice = Some(error.to_string()); }
+            if ui.add_enabled(!self.preview && self.hub.selected > 0 && self.pending_archive.is_none(), egui::Button::new(i18n::choose("Seçili profili arşivle", "Archive selected profile"))).clicked() {
+                let profile = &self.hub.profiles[self.hub.selected];
+                profile.ctl.shutdown.store(true, Ordering::SeqCst); profile.ctl.cancel.store(true, Ordering::SeqCst); profile.ctl.running.store(false, Ordering::SeqCst); profile.ctl.wake();
+                self.pending_archive = Some(profile.entry.id.clone());
+            }
+            ui.label(i18n::choose("Arşivleme motoru durdurur; ayarlar ve hedef dosyalar saklanır. Taşınan ilk profil korunur.", "Archiving stops the worker and retains settings and destination files. The migrated primary profile is protected."));
+            if self.pending_archive.is_some() { ui.spinner(); ui.label(i18n::choose("Profil güvenle durduruluyor…", "Stopping the profile safely…")); }
+            ui.separator(); ui.strong(i18n::choose("Yeni profil", "New profile"));
+            ui.text_edit_singleline(&mut self.profile_name);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.new_kind, crate::rules::ProfileKind::Files, i18n::choose("Genel dosya senkronu", "General file sync"));
+                ui.selectable_value(&mut self.new_kind, crate::rules::ProfileKind::Veeam, "Veeam");
+            });
+            if ui.add_enabled(!self.preview && self.pending_archive.is_none() && !self.profile_name.trim().is_empty(), egui::Button::new(i18n::choose("Oluştur ve yapılandır", "Create and configure"))).clicked() {
+                match self.hub.add(&self.profile_name, self.new_kind) {
+                    Ok(index) => {
+                        self.hub.start(index); self.select_profile(index);
+                        let cfg = self.ctl.config.lock().unwrap().clone(); let a = autostart_enabled();
+                        self.settings = Some(Draft { cfg, pw: String::new(), autostart: a, autostart_orig: a, err: None });
+                        self.profile_name.clear(); close = true;
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+        });
+        self.profiles_open = open && !close;
+    }
+
+    fn rules_window(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.rules_draft.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new(i18n::choose("Dosya kuralları ve önizleme", "File rules and preview")).open(&mut open).default_width(680.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(ctx.content_rect().height() - 160.0).show(ui, |ui| {
+                ui.checkbox(&mut draft.rules.recursive, i18n::choose("Alt klasörleri izle", "Watch subfolders"));
+                ui.label(i18n::choose("Dahil et — her satıra bir desen (*, **, ?)", "Include — one pattern per line (*, **, ?)"));
+                ui.add(egui::TextEdit::multiline(&mut draft.includes).desired_rows(3).desired_width(f32::INFINITY));
+                ui.label(i18n::choose("Hariç tut — her satıra bir desen", "Exclude — one pattern per line"));
+                ui.add(egui::TextEdit::multiline(&mut draft.excludes).desired_rows(3).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| { ui.label(i18n::choose("Değişmeden bekleme (sn)", "Quiet period (sec)")); ui.add(egui::DragValue::new(&mut draft.rules.quiet_seconds).range(0..=86400)); });
+                ui.horizontal(|ui| { ui.label(i18n::choose("Önceki sürüm sayısı", "Previous versions to retain")); ui.add(egui::DragValue::new(&mut draft.rules.keep_versions).range(1..=100)); });
+                ui.checkbox(&mut draft.rules.overwrite_unmanaged, i18n::choose("Önceden var olan kayıtsız dosyaların üzerine yaz (önceki kopya saklanır)", "Allow replacing pre-existing unmanaged files (previous copy is retained)"));
+                ui.checkbox(&mut draft.rules.protect_local_changes, i18n::choose("Uygulama dışında değiştirilen yerel dosyaları koru", "Protect local files changed outside the app"));
+                ui.label(i18n::choose("Kaynakta silinen dosya", "When a source file is deleted"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut draft.rules.deletion, crate::rules::Deletion::Keep, i18n::choose("Yerelde sakla", "Keep locally"));
+                    ui.selectable_value(&mut draft.rules.deletion, crate::rules::Deletion::Quarantine, i18n::choose("Karantinaya taşı", "Quarantine"));
+                    if ui.selectable_value(&mut draft.rules.deletion, crate::rules::Deletion::Mirror, i18n::choose("Hedeften sil", "Delete from target")).changed() { draft.delete_confirmed = false; }
+                });
+                if draft.rules.deletion == crate::rules::Deletion::Mirror { ui.checkbox(&mut draft.delete_confirmed, i18n::choose("Yalnızca yönetilen dosyalara kalıcı silme uygulanmasını onaylıyorum", "I approve permanent deletion of managed files only")); }
+                draft.rules.include = draft.includes.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+                draft.rules.exclude = draft.excludes.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(i18n::choose("Ne yapılacağını göster", "Preview actions")).clicked() {
+                        let result = (|| -> anyhow::Result<Vec<crate::generic::Item>> {
+                            let mut cfg = self.ctl.config.lock().unwrap().clone(); cfg.rules = draft.rules.clone();
+                            cfg.rules.compile()?;
+                            let snapshot = self.ctl.snapshot.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("Scan this profile before previewing rules"))?;
+                            if snapshot.context != crate::generic::source_context(&cfg) { anyhow::bail!("Source changed; scan the updated profile first"); }
+                            let state = crate::generic::FileState::load(&cfg.local_root)?;
+                            state.check_source(&snapshot.context)?;
+                            let local = crate::generic::local_files(&cfg, &snapshot, &state)?;
+                            crate::generic::plan(&cfg, &snapshot, &state, &local, chrono::Utc::now().timestamp(), None, true)
+                        })();
+                        match result { Ok(items) => { draft.preview = items; draft.error = None; }, Err(error) => draft.error = Some(error.to_string()) }
+                    }
+                    if ui.button(i18n::choose("Kuralları kopyala", "Copy rules")).clicked() && let Ok(json) = serde_json::to_string_pretty(&draft.rules) { ctx.copy_text(json); }
+                    if ui.add_enabled(!self.preview && (draft.rules.deletion != crate::rules::Deletion::Mirror || draft.delete_confirmed), egui::Button::new(i18n::choose("Kuralları kaydet", "Save rules"))).clicked() { save = true; }
+                });
+                if let Some(error) = &draft.error { ui.colored_label(RED, error); }
+                if !draft.preview.is_empty() {
+                    let transfers = draft.preview.iter().filter(|i| i.action == crate::generic::Action::Copy).count();
+                    let bytes = draft.preview.iter().map(|i| i.bytes).sum();
+                    ui.strong(format!("{} · {} / {}", human(bytes), transfers, draft.preview.len()));
+                    for item in draft.preview.iter().take(500) { ui.label(format!("{}  {} — {}", item.action.label(), item.name, i18n::display(&item.reason))); }
+                    if draft.preview.len() > 500 { ui.label(i18n::choose("İlk 500 sonuç gösteriliyor.", "Showing the first 500 results.")); }
+                }
+                ui.separator(); ui.strong(i18n::choose("Son çalışmalar", "Recent runs"));
+                let cfg = self.ctl.config.lock().unwrap().clone();
+                if let Ok(state) = crate::generic::FileState::load(&cfg.local_root) {
+                    for run in state.history.iter().rev().take(15) { ui.label(format!("{} · {} {} · {} {} · {}{}", fmt_time(run.at), run.copied, i18n::choose("aktarıldı", "transferred"), run.removed, i18n::choose("kaldırıldı", "removed"), human(run.bytes), run.error.as_ref().map(|s| format!(" · {s}")).unwrap_or_default())); }
+                }
+            });
+        });
+        if save {
+            match draft.rules.compile() {
+                Err(error) => draft.error = Some(error.to_string()),
+                Ok(_) => {
+                    let mut config = self.ctl.config.lock().unwrap();
+                    let mut next = config.clone();
+                    next.rules = draft.rules.clone();
+                    match next.save() {
+                        Ok(()) => {
+                            *config = next;
+                            drop(config);
+                            self.ctl.cancel.store(true, Ordering::SeqCst);
+                            self.ctl.scan_now.store(true, Ordering::SeqCst);
+                            self.ctl.wake();
+                            return;
+                        }
+                        Err(error) => draft.error = Some(error.to_string()),
+                    }
+                }
+            }
+        }
+        if open {
+            self.rules_draft = Some(draft);
+        }
+    }
+}
+
+impl App {
     fn update_window(&mut self, ctx: &egui::Context, transferring: bool) {
         if !self.update_open {
             return;
@@ -2049,7 +2329,7 @@ impl App {
                 crate::update::State::Available(release) => {
                     ui.colored_label(BLUE, i18n::choose(format!("Yeni sürüm: {}", release.version), format!("New version: {}", release.version)));
                     if ui.add_enabled(!self.preview, egui::Button::new(i18n::choose("İndir ve doğrula", "Download and verify"))).clicked() {
-                        let token = self.ctl.config.lock().unwrap().github_token();
+                        let token = self.primary.config.lock().unwrap().github_token();
                         self.updater.download(release, token);
                     }
                 }
@@ -2058,11 +2338,7 @@ impl App {
                     ui.colored_label(GREEN, i18n::choose(format!("{} doğrulandı, kuruluma hazır.", package.version), format!("{} verified and ready to install.", package.version)));
                     if transferring { ui.colored_label(AMBER, i18n::choose("Aktarım tamamlandıktan sonra güncelleyebilirsiniz.", "You can apply the update after the transfer finishes.")); }
                     if ui.add_enabled(installed && !transferring && !self.preview && self.update_pending.is_none(), egui::Button::new(i18n::choose("Güncelle ve yeniden başlat", "Update and restart"))).clicked() {
-                        self.ctl.running.store(false, Ordering::SeqCst);
-                        self.ctl.shutdown.store(true, Ordering::SeqCst);
-                        self.ctl.cancel.store(true, Ordering::SeqCst);
-                        *self.ctl.force_vm.lock().unwrap() = None;
-                        self.ctl.wake();
+                        self.hub.request_shutdown();
                         self.update_pending = Some(package);
                         self.updater.state = crate::update::State::Applying;
                     }
@@ -2071,7 +2347,7 @@ impl App {
                 crate::update::State::Error(error) => { ui.colored_label(RED, error); }
             }
             if ui.add_enabled(!self.preview && !self.updater.busy() && self.update_pending.is_none(), egui::Button::new(i18n::choose("Güncellemeleri kontrol et", "Check for updates"))).clicked() {
-                self.updater.check(self.ctl.config.lock().unwrap().github_token());
+                self.updater.check(self.primary.config.lock().unwrap().github_token());
             }
             ui.separator();
             ui.strong(i18n::choose("Private repo erişimi", "Private repository access"));
@@ -2081,11 +2357,11 @@ impl App {
             let mut clear_token = false;
             ui.horizontal(|ui| {
                 save_token = ui.add_enabled(!self.preview && !self.updater.busy() && !self.update_token.trim().is_empty(), egui::Button::new(i18n::choose("Token kaydet", "Save token"))).clicked();
-                clear_token = ui.add_enabled(!self.preview && !self.updater.busy() && !self.ctl.config.lock().unwrap().github_token_enc.is_empty(), egui::Button::new(i18n::choose("Kayıtlı token'ı kaldır", "Remove saved token"))).clicked();
+                clear_token = ui.add_enabled(!self.preview && !self.updater.busy() && !self.primary.config.lock().unwrap().github_token_enc.is_empty(), egui::Button::new(i18n::choose("Kayıtlı token'ı kaldır", "Remove saved token"))).clicked();
             });
             if save_token || clear_token {
                 let result = (|| -> anyhow::Result<()> {
-                    let mut config = self.ctl.config.lock().unwrap();
+                    let mut config = self.primary.config.lock().unwrap();
                     let mut next = config.clone();
                     next.set_github_token(if clear_token { "" } else { self.update_token.trim() })?;
                     next.save()?;
@@ -2194,6 +2470,44 @@ mod tests {
             }
         }
         crate::i18n::set_language(crate::i18n::Language::Turkish);
+    }
+    #[test]
+    fn generic_dashboard_and_rules_render_in_both_languages() {
+        for language in [
+            crate::i18n::Language::Turkish,
+            crate::i18n::Language::English,
+        ] {
+            for size in [vec2(900.0, 500.0), vec2(1500.0, 900.0)] {
+                let ctx = egui::Context::default();
+                setup_fonts(&ctx);
+                let cfg = Config {
+                    kind: ProfileKind::Files,
+                    mode: UpdateMode::Safe,
+                    language,
+                    ..Default::default()
+                };
+                let ctl = Control::new(cfg.clone());
+                crate::preview::populate_files(&ctl);
+                let mut app = App::new(ctl, true);
+                app.selected = Some("documents/report.pdf".into());
+                app.rules_draft = Some(RulesDraft {
+                    rules: cfg.rules.clone(),
+                    includes: "**".into(),
+                    excludes: "**/*.tmp".into(),
+                    delete_confirmed: false,
+                    error: None,
+                    preview: Vec::new(),
+                });
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+                        ..Default::default()
+                    },
+                    |ui| app.render(ui),
+                );
+                assert!(!output.shapes.is_empty());
+            }
+        }
     }
     #[test]
     fn settings_reject_invalid_scheduler_values() {

@@ -8,6 +8,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stats {
+    #[serde(skip)]
+    path: Option<PathBuf>,
     pub total_bytes: u64,
     /// seconds in which data was actually received
     pub active_secs: u64,
@@ -21,15 +23,18 @@ impl Stats {
     fn path() -> PathBuf {
         Config::path().with_file_name("stats.json")
     }
-    pub fn load() -> Stats {
-        std::fs::read(Self::path())
+    pub fn load_for(config: &Config) -> Stats {
+        let path = config.save_path().with_file_name("stats.json");
+        let mut stats: Stats = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        stats.path = Some(path);
+        stats
     }
     pub fn save(&self) {
         if let Ok(b) = serde_json::to_vec_pretty(self) {
-            let _ = write_atomic(&Self::path(), &b);
+            let _ = write_atomic(&self.path.clone().unwrap_or_else(Self::path), &b);
         }
     }
     pub fn add(&mut self, bytes: u64) {

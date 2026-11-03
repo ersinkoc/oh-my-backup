@@ -1,5 +1,40 @@
 //! Offline UI review fixtures. No SSH connection, sampler, config writes or transfers.
 use crate::i18n;
+
+pub fn populate_files(ctl: &Control) {
+    populate(ctl);
+    let mut s = ctl.shared.lock().unwrap();
+    s.activity = None;
+    for (i, v) in s.vms.iter_mut().enumerate() {
+        v.name = [
+            "documents/report.pdf",
+            "photos/trip/image.jpg",
+            "exports/orders.csv",
+            "notes.txt",
+            "uploads/video.mp4",
+            "cache/data.tmp",
+        ][i]
+            .into();
+        v.remote[0].name = v.name.clone();
+        v.file_action = Some(if v.in_sync {
+            crate::generic::Action::Current
+        } else if v.excluded {
+            crate::generic::Action::Excluded
+        } else {
+            crate::generic::Action::Wait
+        });
+        v.file_reason = Some(
+            if v.in_sync {
+                "Source and managed local copy match"
+            } else {
+                "Waiting for the quiet period"
+            }
+            .into(),
+        );
+        v.busy = false;
+        v.job = None;
+    }
+}
 use crate::{
     config::Plan,
     remote::RemoteFile,
@@ -29,6 +64,8 @@ pub fn populate(ctl: &Control) {
         let size = (i as u64 + 1) * (80 << 30);
         let synced = i == 0 || i == 3;
         s.vms.push(VmView {
+            file_action: None,
+            file_reason: None,
             name: name.to_string(),
             remote: vec![RemoteFile {
                 name: format!("{name}.vbk"),

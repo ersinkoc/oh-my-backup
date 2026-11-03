@@ -55,6 +55,10 @@ impl Plan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub kind: crate::rules::ProfileKind,
+    pub rules: crate::rules::FileRules,
+    #[serde(skip)]
+    pub storage_path: Option<PathBuf>,
     pub language: crate::i18n::Language,
     /// Optional GitHub token, DPAPI encrypted for this Windows user.
     pub github_token_enc: String,
@@ -92,6 +96,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            kind: crate::rules::ProfileKind::Veeam,
+            rules: crate::rules::FileRules::default(),
+            storage_path: None,
             language: crate::i18n::Language::default(),
             github_token_enc: String::new(),
             host: String::new(),
@@ -158,6 +165,12 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
+        if self.kind == crate::rules::ProfileKind::Files {
+            self.rules.compile().map_err(|e| e.to_string())?;
+            if self.mode != UpdateMode::Safe {
+                return Err("File profiles require safe updates".into());
+            }
+        }
         if self.host.trim().is_empty() || self.user.trim().is_empty() || self.port == 0 {
             return Err(i18n::text("Sunucu, kullanıcı ve port (1–65535) gerekli").into());
         }
@@ -193,21 +206,35 @@ impl Config {
         }
     }
     pub fn load() -> Config {
-        let p = Self::path();
-        let Ok(b) = std::fs::read(&p) else {
-            return Config::default();
+        Self::load_from(&Self::path())
+    }
+    pub fn load_from(p: &Path) -> Config {
+        let Ok(b) = std::fs::read(p) else {
+            return Config {
+                storage_path: Some(p.to_owned()),
+                ..Config::default()
+            };
         };
-        match serde_json::from_slice(&b) {
-            Ok(c) => c,
+        match serde_json::from_slice::<Config>(&b) {
+            Ok(mut c) => {
+                c.storage_path = Some(p.to_owned());
+                c
+            }
             Err(_) => {
                 // keep the unreadable file instead of silently overwriting it later
-                let _ = std::fs::copy(&p, p.with_file_name("config.json.bad"));
-                Config::default()
+                let _ = std::fs::copy(p, p.with_file_name("config.json.bad"));
+                Config {
+                    storage_path: Some(p.to_owned()),
+                    ..Config::default()
+                }
             }
         }
     }
     pub fn save(&self) -> Result<()> {
-        write_atomic(&Self::path(), &serde_json::to_vec_pretty(self)?)
+        write_atomic(&self.save_path(), &serde_json::to_vec_pretty(self)?)
+    }
+    pub fn save_path(&self) -> PathBuf {
+        self.storage_path.clone().unwrap_or_else(Self::path)
     }
     pub fn password(&self) -> String {
         if self.password_enc.is_empty() {
