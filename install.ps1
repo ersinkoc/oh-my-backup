@@ -201,7 +201,18 @@ function Write-UpdateResult([string]$Status, [string]$Version) {
     Write-Json (Join-Path $script:UpdateRoot 'last-result.json') @{status=$Status; version=$Version; time=[DateTime]::UtcNow.ToString('o')}
 }
 
-function Install-Executable([string]$Exe, [string]$Version, [bool]$Launch = $false, [bool]$RequireNewer = $false) {
+function Resolve-InstallSource([string]$Exe, [string]$Version, [bool]$Explicit) {
+    $target = Join-Path $script:InstallRoot 'oh-my-backup.exe'
+    if (-not $Explicit -and (Test-Path -LiteralPath $target)) {
+        $installed = Get-ExecutableVersion $target
+        if ((Get-StableVersion $installed) -gt (Get-StableVersion $Version)) {
+            return [pscustomobject]@{exe=$target; version=$installed}
+        }
+    }
+    return [pscustomobject]@{exe=$Exe; version=$Version}
+}
+
+function Install-Executable([string]$Exe, [string]$Version, [bool]$Launch = $false, [bool]$RequireNewer = $false, [bool]$AllowDowngrade = $true) {
     Assert-PlainPath $script:InstallRoot
     [IO.Directory]::CreateDirectory($script:InstallRoot) | Out-Null
     foreach ($leaf in @('.install.lock','oh-my-backup.exe','oh-my-backup.previous.exe','install.json')) { Assert-PlainPath (Join-Path $script:InstallRoot $leaf) }
@@ -216,6 +227,7 @@ function Install-Executable([string]$Exe, [string]$Version, [bool]$Launch = $fal
         $oldManifest = if (Test-Path -LiteralPath $manifestPath) { [IO.File]::ReadAllBytes($manifestPath) } else { $null }
         if ((Get-ExecutableVersion $Exe) -ne $Version) { throw 'Installer version preflight failed.' }
         if ($RequireNewer -and $hadPrevious -and (Get-StableVersion (Get-ExecutableVersion $target)) -ge (Get-StableVersion $Version)) { throw 'A newer executable is already installed.' }
+        if (-not $AllowDowngrade -and $hadPrevious -and (Get-StableVersion (Get-ExecutableVersion $target)) -gt (Get-StableVersion $Version)) { throw 'A newer executable is already installed.' }
         $identical = $hadPrevious -and (Get-FileHash -LiteralPath $target).Hash -eq (Get-FileHash -LiteralPath $Exe).Hash
         if ($hadPrevious -and -not $identical) {
             $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq $target } catch { $false } })
@@ -287,7 +299,7 @@ function Invoke-ApplyUpdate([string]$Directory, [int]$OwnerId, [long]$OwnerStart
     try {
         try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
         if (-not $owned) { throw 'A backup engine is still running; update postponed.' }
-        Install-Executable $exe $version $false $true
+        Install-Executable $exe $version $false $true $false
     } finally { if ($owned) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
     if ($Launch) { Start-Process -FilePath (Join-Path $script:InstallRoot 'oh-my-backup.exe') | Out-Null }
 }
@@ -379,7 +391,10 @@ try {
                 $prepared = Get-PreparedPackage (Get-Release $token) $token
                 $SourceExe = Join-Path $prepared.directory 'payload/oh-my-backup.exe'; $version = $prepared.version
             }
-            Install-Executable $SourceExe $version ([bool]$Restart)
+            $explicit = $PSBoundParameters.ContainsKey('SourceExe')
+            $selected = Resolve-InstallSource $SourceExe $version $explicit
+            $version = $selected.version
+            Install-Executable $selected.exe $version ([bool]$Restart) $false $explicit
             $installedScript = Join-Path $script:InstallRoot 'install.ps1'
             if ([IO.Path]::GetFullPath($PSCommandPath) -ne $installedScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $installedScript -Force }
             Set-AppShortcuts

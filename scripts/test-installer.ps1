@@ -110,6 +110,11 @@ Write-Json (Join-Path $script:InstallRoot 'install.json') @{product='OhMyBackup'
 Expect-Error { Invoke-ApplyUpdate $downgrade 0 0 $false } 'Stale manifest allowed executable downgrade'
 Assert (([IO.File]::ReadAllText($target)) -eq 'fixture:0.3.0') 'Stale-manifest check changed executable'
 Expect-Error { Install-Executable $new '0.2.0' $false $true } 'Locked installer allowed an automatic downgrade'
+$selection = Resolve-InstallSource $new '0.2.0' $false
+Assert ($selection.version -eq '0.3.0' -and $selection.exe -eq $target) 'Bootstrap selected an older release over a newer install'
+$selection = Resolve-InstallSource $new '0.2.0' $true
+Assert ($selection.version -eq '0.2.0' -and $selection.exe -eq $new) 'Explicit local recovery should remain possible'
+Expect-Error { Install-Executable $new '0.2.0' $false $false $false } 'Bootstrap downgrade guard failed under lock'
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem

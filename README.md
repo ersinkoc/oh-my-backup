@@ -14,7 +14,7 @@ Run the self-contained `install.ps1` at the repository root, or extract a releas
 ./install.ps1 -SourceExe ./target/release/oh-my-backup.exe
 ```
 
-Close an already-running installed copy before manual installation. Use `-NoDesktopShortcut`, `-NoStartMenu` or `-Restart` when needed. The legacy `scripts/install.ps1` entry point forwards to the root installer.
+Close an already-running installed copy before replacing it. Reinstalling an identical binary preserves the previous-version backup. A bootstrap or bundled installer keeps a newer installed version instead of downgrading it. Use `-NoDesktopShortcut`, `-NoStartMenu` or `-Restart` when needed. The legacy `scripts/install.ps1` entry point forwards to the root installer.
 
 ## Updates inside the app
 
