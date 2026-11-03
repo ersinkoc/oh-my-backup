@@ -10,7 +10,7 @@ RULES = {
     "embedded SSH fingerprint": r"SHA256:[A-Za-z0-9+/]{30,}={0,2}",
     "GitHub credential": r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b",
     "private key": r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----",
-    "saved encrypted credential": r'"password_enc"\s*:\s*"[^"\s]+"',
+    "saved encrypted credential": r'"(?:password_enc|github_token_enc)"\s*:\s*"[^"\s]+"',
     "email address": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
 }
 FORBIDDEN = {".env", "config.json", "state.json", "stats.json"}

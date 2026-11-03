@@ -56,6 +56,8 @@ impl Plan {
 #[serde(default)]
 pub struct Config {
     pub language: crate::i18n::Language,
+    /// Optional GitHub token, DPAPI encrypted for this Windows user.
+    pub github_token_enc: String,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -91,6 +93,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             language: crate::i18n::Language::default(),
+            github_token_enc: String::new(),
             host: String::new(),
             port: 22,
             user: "backup".into(),
@@ -132,6 +135,28 @@ pub fn app_dir() -> PathBuf {
 }
 
 impl Config {
+    pub fn github_token(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.github_token_enc)
+            .ok()
+            .and_then(|b| dpapi::unprotect(&b).ok())
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_github_token(&mut self, token: &str) -> Result<()> {
+        use base64::Engine;
+        if token.len() > 4096 || token.chars().any(char::is_whitespace) {
+            anyhow::bail!("Invalid GitHub token: whitespace or excessive length");
+        }
+        self.github_token_enc = if token.is_empty() {
+            String::new()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(dpapi::protect(token.as_bytes())?)
+        };
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.host.trim().is_empty() || self.user.trim().is_empty() || self.port == 0 {
             return Err(i18n::text("Sunucu, kullanıcı ve port (1–65535) gerekli").into());

@@ -2,9 +2,15 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
-## Unreleased
+## 0.2.0 — 2026-11-03
 
-- Add the MIT license to the repository, package metadata and subsequent distribution archives.
+- Add a self-contained root installer with a fixed per-user installation folder, stable shortcuts, an installation manifest and existing-startup migration.
+- Add in-app update checks, verified background downloads and safe update/restart in Turkish and English.
+- Support private releases through existing GitHub CLI authentication, token environment variables or an optional DPAPI-encrypted token.
+- Validate checksums, asset digests, archive paths, executable versions and monotonic updates; preserve the previous EXE and restore it on installation failures.
+- Wait for engine shutdown and final statistics before handing executable replacement to a separate process.
+- Include the MIT license in distribution archives.
+- Add installer boundary tests and cache release build artifacts in Windows CI.
 
 ## 0.1.0 — 2026-11-03
 

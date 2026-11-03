@@ -10,6 +10,7 @@ mod schedule;
 mod stats;
 mod sync;
 mod ui;
+mod update;
 
 use eframe::egui;
 
@@ -17,6 +18,21 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--version" {
         println!("Oh My Backup {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.len() == 2 && args[1] == "--check-update" {
+        let cfg = config::Config::load();
+        match update::check(&cfg.github_token()) {
+            Ok(release) => println!(
+                "Installed: {}; latest stable: {}",
+                env!("CARGO_PKG_VERSION"),
+                release.version
+            ),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
     let preview = args.iter().any(|arg| arg == "--preview");

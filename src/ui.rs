@@ -35,6 +35,10 @@ pub struct App {
     notice: Option<String>,
     confirm_exit: bool,
     closing: bool,
+    updater: crate::update::Updater,
+    update_open: bool,
+    update_token: String,
+    update_pending: Option<crate::update::Prepared>,
 }
 
 /// Settings being edited (applied only on "Kaydet").
@@ -145,6 +149,10 @@ impl App {
             notice: None,
             confirm_exit: false,
             closing: false,
+            updater: crate::update::Updater::default(),
+            update_open: false,
+            update_token: String::new(),
+            update_pending: None,
         }
     }
 
@@ -392,6 +400,21 @@ impl eframe::App for App {
 impl App {
     fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.updater.poll();
+        if let Some(package) = self.update_pending.clone() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.ctl.engine_stopped.load(Ordering::SeqCst)
+                && self.ctl.sampler_stopped.load(Ordering::SeqCst)
+            {
+                match self.updater.launch_apply(&package) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => {
+                        self.updater.state = crate::update::State::Error(error.to_string())
+                    }
+                }
+                self.update_pending = None;
+            }
+        }
         if self.logo.is_none() {
             self.logo = Some(ctx.load_texture(
                 "hbsync-logo",
@@ -527,6 +550,7 @@ impl App {
                     let a = !self.preview && autostart_enabled();
                     self.settings = Some(Draft { cfg: cfg.clone(), pw: String::new(), autostart: a, autostart_orig: a, err: None });
                 }
+                if ui.button(i18n::choose("↻ Güncellemeler", "↻ Updates")).clicked() { self.update_open = true; }
                 ui.separator();
                 let mode = match cfg.mode {
                     UpdateMode::InPlace => i18n::text("Mod: yerinde"),
@@ -970,6 +994,7 @@ impl App {
                 });
         }
         self.settings_window(&ctx, act.is_some());
+        self.update_window(&ctx, act.is_some());
     }
 }
 
@@ -2001,6 +2026,89 @@ fn autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+impl App {
+    fn update_window(&mut self, ctx: &egui::Context, transferring: bool) {
+        if !self.update_open {
+            return;
+        }
+        let mut open = true;
+        let state = self.updater.state.clone();
+        let installed = crate::update::is_installed();
+        egui::Window::new(i18n::choose("Uygulama güncellemeleri", "Application updates")).open(&mut open).default_width(520.0).resizable(false).show(ctx, |ui| {
+            ui.label(format!("Oh My Backup v{}", env!("CARGO_PKG_VERSION")));
+            ui.label(crate::update::install_root().display().to_string());
+            if !installed {
+                ui.colored_label(AMBER, i18n::choose("İçeriden güncellemek için önce install.ps1 ile sabit klasöre kurun.", "Run install.ps1 to install in the fixed folder before applying updates."));
+            }
+            ui.label(i18n::choose("Kararlı GitHub sürümleri kontrol edilir; eski sürüme dönüş yapılmaz.", "Checks stable GitHub releases; automatic downgrades are blocked."));
+            ui.separator();
+            match state {
+                crate::update::State::Idle => { ui.label(i18n::choose("Güncelleme henüz kontrol edilmedi.", "Updates have not been checked yet.")); }
+                crate::update::State::Checking => { ui.spinner(); ui.label(i18n::choose("Sürüm kontrol ediliyor…", "Checking releases…")); }
+                crate::update::State::Current(latest) => { ui.colored_label(GREEN, i18n::choose(format!("Güncelsiniz. Son yayınlanan: {latest}"), format!("You are up to date. Latest published: {latest}"))); }
+                crate::update::State::Available(release) => {
+                    ui.colored_label(BLUE, i18n::choose(format!("Yeni sürüm: {}", release.version), format!("New version: {}", release.version)));
+                    if ui.add_enabled(!self.preview, egui::Button::new(i18n::choose("İndir ve doğrula", "Download and verify"))).clicked() {
+                        let token = self.ctl.config.lock().unwrap().github_token();
+                        self.updater.download(release, token);
+                    }
+                }
+                crate::update::State::Downloading => { ui.spinner(); ui.label(i18n::choose("Paket indiriliyor ve SHA-256 ile doğrulanıyor…", "Downloading and verifying the package with SHA-256…")); }
+                crate::update::State::Ready(package) => {
+                    ui.colored_label(GREEN, i18n::choose(format!("{} doğrulandı, kuruluma hazır.", package.version), format!("{} verified and ready to install.", package.version)));
+                    if transferring { ui.colored_label(AMBER, i18n::choose("Aktarım tamamlandıktan sonra güncelleyebilirsiniz.", "You can apply the update after the transfer finishes.")); }
+                    if ui.add_enabled(installed && !transferring && !self.preview && self.update_pending.is_none(), egui::Button::new(i18n::choose("Güncelle ve yeniden başlat", "Update and restart"))).clicked() {
+                        self.ctl.running.store(false, Ordering::SeqCst);
+                        self.ctl.shutdown.store(true, Ordering::SeqCst);
+                        self.ctl.cancel.store(true, Ordering::SeqCst);
+                        *self.ctl.force_vm.lock().unwrap() = None;
+                        self.ctl.wake();
+                        self.update_pending = Some(package);
+                        self.updater.state = crate::update::State::Applying;
+                    }
+                }
+                crate::update::State::Applying => { ui.spinner(); ui.label(i18n::choose("Motor güvenle durduruluyor. Uygulama güncellenip yeniden açılacak…", "Stopping the engine safely. The app will update and restart…")); }
+                crate::update::State::Error(error) => { ui.colored_label(RED, error); }
+            }
+            if ui.add_enabled(!self.preview && !self.updater.busy() && self.update_pending.is_none(), egui::Button::new(i18n::choose("Güncellemeleri kontrol et", "Check for updates"))).clicked() {
+                self.updater.check(self.ctl.config.lock().unwrap().github_token());
+            }
+            ui.separator();
+            ui.strong(i18n::choose("Private repo erişimi", "Private repository access"));
+            ui.label(i18n::choose("Varsa mevcut gh oturumu veya GH_TOKEN kullanılır. Alternatif: bu repo için Contents: read yetkili token kaydedin.", "Uses an existing gh session or GH_TOKEN when available. Alternatively, save a token with Contents: read for this repository."));
+            ui.add(egui::TextEdit::singleline(&mut self.update_token).password(true).hint_text(i18n::choose("GitHub token (DPAPI ile şifrelenir)", "GitHub token (encrypted with DPAPI)")));
+            let mut save_token = false;
+            let mut clear_token = false;
+            ui.horizontal(|ui| {
+                save_token = ui.add_enabled(!self.preview && !self.updater.busy() && !self.update_token.trim().is_empty(), egui::Button::new(i18n::choose("Token kaydet", "Save token"))).clicked();
+                clear_token = ui.add_enabled(!self.preview && !self.updater.busy() && !self.ctl.config.lock().unwrap().github_token_enc.is_empty(), egui::Button::new(i18n::choose("Kayıtlı token'ı kaldır", "Remove saved token"))).clicked();
+            });
+            if save_token || clear_token {
+                let result = (|| -> anyhow::Result<()> {
+                    let mut config = self.ctl.config.lock().unwrap();
+                    let mut next = config.clone();
+                    next.set_github_token(if clear_token { "" } else { self.update_token.trim() })?;
+                    next.save()?;
+                    *config = next;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => { self.update_token.clear(); self.updater.state = crate::update::State::Idle; }
+                    Err(error) => self.updater.state = crate::update::State::Error(error.to_string()),
+                }
+            }
+            if let Ok(bytes) = std::fs::read(crate::update::cache_root().join("last-result.json"))
+                && let Ok(result) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    ui.label(format!("{}: {} {}", i18n::choose("Son güncelleme", "Last update"), result["status"].as_str().unwrap_or(""), result["version"].as_str().unwrap_or("")));
+                }
+        });
+        self.update_open = open;
+        if !open {
+            self.update_token.clear();
+        }
+    }
+}
+
 fn set_autostart(on: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -2067,6 +2175,7 @@ mod tests {
                 crate::preview::populate(&ctl);
                 let mut app = App::new(ctl, true);
                 app.selected = Some("03_APPLICATION".into());
+                app.update_open = true;
                 app.settings = Some(Draft {
                     cfg: app.ctl.config.lock().unwrap().clone(),
                     pw: String::new(),

@@ -96,6 +96,9 @@ pub struct Shared {
 }
 
 pub struct Control {
+    pub shutdown: AtomicBool,
+    pub engine_stopped: AtomicBool,
+    pub sampler_stopped: AtomicBool,
     pub running: AtomicBool,
     pub cancel: AtomicBool,
     pub scan_now: AtomicBool,
@@ -123,6 +126,9 @@ impl Control {
     pub fn new(cfg: Config) -> Arc<Control> {
         let state = State::load(&cfg.local_root);
         Arc::new(Control {
+            shutdown: AtomicBool::new(false),
+            engine_stopped: AtomicBool::new(false),
+            sampler_stopped: AtomicBool::new(false),
             running: AtomicBool::new(cfg.auto_start),
             cancel: AtomicBool::new(false),
             scan_now: AtomicBool::new(true),
@@ -259,6 +265,14 @@ pub fn start_sampler(ctl: Arc<Control>) {
                 s.session_active_s += 1;
                 s.stats.add(d);
                 dirty = true;
+            }
+            if ctl.shutdown.load(Ordering::SeqCst) {
+                let stats = s.stats.clone();
+                drop(s);
+                stats.save();
+                ctl.sampler_stopped.store(true, Ordering::SeqCst);
+                ctl.repaint();
+                return;
             }
             if dirty && last_save.elapsed() > Duration::from_secs(30) {
                 let st = s.stats.clone();
@@ -780,13 +794,28 @@ fn recover_trash(ctl: &Control, cfg: &Config) {
     }
 }
 
+struct EngineExit(Arc<Control>);
+impl Drop for EngineExit {
+    fn drop(&mut self) {
+        self.0.engine_stopped.store(true, Ordering::SeqCst);
+        self.0.repaint();
+    }
+}
+
 pub async fn engine(ctl: Arc<Control>) {
+    let _exit = EngineExit(ctl.clone());
+    if ctl.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
     let mut remote: Option<Arc<Remote>> = None;
     let mut listing: Option<RemoteListing> = None;
     let mut last_scan = 0i64;
     ctl.log(i18n::text("Motor başlatıldı"));
     let mut recovered_root = None;
     loop {
+        if ctl.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         let cfg = ctl.config.lock().unwrap().clone();
         if let Err(e) = cfg.validate() {
             ctl.shared.lock().unwrap().waiting = i18n::choose(
@@ -902,7 +931,10 @@ pub async fn engine(ctl: Arc<Control>) {
             || listing.is_none()
             || t - last_scan >= cfg.scan_interval_min as i64 * 60
         {
-            match r.list(&cfg.remote_root).await {
+            match r
+                .list_cancellable(&cfg.remote_root, &|| ctl.shutdown.load(Ordering::SeqCst))
+                .await
+            {
                 Ok(l) => {
                     let c2 = cfg.clone();
                     let ctl2 = ctl.clone();
@@ -1084,7 +1116,7 @@ struct Env<'a> {
 
 impl Env<'_> {
     fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst) != STOP_NONE
+        self.ctl.shutdown.load(Ordering::SeqCst) || self.stop.load(Ordering::SeqCst) != STOP_NONE
     }
     fn check(&self) -> Result<()> {
         if self.stopped() {
@@ -2197,6 +2229,16 @@ impl PosIo for File {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn shutdown_before_start_acknowledges_without_network_or_recovery() {
+        let ctl = Control::new(Config::default());
+        ctl.shutdown.store(true, Ordering::SeqCst);
+        engine(ctl.clone()).await;
+        assert!(ctl.engine_stopped.load(Ordering::SeqCst));
+        let shared = ctl.shared.lock().unwrap();
+        assert!(shared.log.is_empty());
+        assert!(shared.activity.is_none());
+    }
     #[test]
     fn deleted_or_truncated_local_backup_is_pending() {
         let root = std::env::temp_dir().join(format!("hbsync-local-proof-{}", std::process::id()));

@@ -232,6 +232,14 @@ impl Remote {
     }
 
     pub async fn list(&self, root: &str) -> Result<RemoteListing> {
+        self.list_cancellable(root, &|| false).await
+    }
+
+    pub async fn list_cancellable(
+        &self,
+        root: &str,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<RemoteListing> {
         let mut out = Vec::new();
         self.exec_stream(
             &["list", root],
@@ -240,7 +248,7 @@ impl Remote {
                 out.extend_from_slice(d);
                 Ok(())
             },
-            &|| false,
+            cancel,
         )
         .await?;
         serde_json::from_slice(&out).context(i18n::text("liste çözümlenemedi"))

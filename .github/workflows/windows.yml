@@ -9,25 +9,47 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust checks
         run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
       - name: Select toolchain
         run: rustup override set 1.93.0
+      - name: Cache Rust dependencies and release artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-rust-1.93-release-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-rust-1.93-release-v2-
+      - name: Consistent private-path remapping
+        shell: pwsh
+        run: |
+          $flags = "--remap-path-prefix=$pwd=/source$([char]31)--remap-path-prefix=$env:USERPROFILE=/toolchain"
+          "CARGO_ENCODED_RUSTFLAGS=$flags" >> $env:GITHUB_ENV
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --release --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --release --locked
       - name: Check source privacy
         run: python scripts/check-source-privacy.py
       - name: Test privacy guard
         run: python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Test installer and updater boundaries
+        shell: powershell
+        run: ./scripts/test-installer.ps1
       - name: Check release version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh

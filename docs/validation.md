@@ -1,5 +1,19 @@
 # Desktop review and validation
 
+## Version 0.2.0 — installation and self-update
+
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo test --locked`: 17 passed, including numeric version comparison, malformed version rejection, update worker completion/disconnection, DPAPI token round trip/removal, token validation, shutdown acknowledgement and rendering the Updates dialog in both languages and viewport sizes.
+- Four source-privacy guard tests: passed; the guard also rejects persisted encrypted GitHub credentials from source control.
+- `scripts/test-installer.ps1`: passed in Windows PowerShell 5.1 and PowerShell 7. Tests cover install/upgrade, identical reinstall preserving the previous EXE, failed first-install cleanup, failed replacement rollback, missing legacy manifest restoration, competing file locks, a separately gated process holding the engine mutex, cache boundaries, payload tampering, stale-manifest downgrades, downgrade checks under the installation lock, archive traversal/duplicates, invalid HTTPS boundaries and checksum/digest mismatch.
+- The stale-manifest downgrade regression was observed failing before the actual installed-executable version check was added.
+- A live read-only private-repository check succeeded through the installed GitHub CLI session. The real v0.1.0 release was downloaded, checksum/digest validated, extracted with the archive allowlist and checked through `--version`.
+- `scripts/test-installed-update.ps1` upgraded the real v0.1.0 binary to the built v0.2.0 binary in an isolated fixed-layout folder. Version output, manifest, SHA-256 identity and the retained previous binary were verified. Windows startup registration was replaced with a no-op only in this isolated test.
+- The root installer installed v0.2.0 into its real fixed user folder, refreshed shortcuts and copied the MIT license. The installed binary's `--check-update` command read the private latest release successfully. No GUI restart or production transfer was triggered by this check.
+- `scripts/package.ps1` and `scripts/verify-package.py`: the v0.2.0 archive, checksum, x64 executable, nine icon sizes, private build-path removal and version startup checks passed.
+
+The actual GUI update/restart interaction during a live transfer was not exercised. Its guards are covered by source review, engine shutdown tests, headless UI rendering and the isolated installer tests. Runtime crashes after a completed restart are outside the installer rollback contract. GitHub's v0.2.0 workflow and release publication are separate hosted outcomes.
+
 ## Round 1 — desktop, configuration and local-state correctness
 
 ### Summary

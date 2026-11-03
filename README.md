@@ -6,7 +6,27 @@ A Windows desktop companion for keeping remote Veeam backup sets in sync over SS
 
 ## Use
 
-Download the versioned Windows ZIP from this repository's Releases, extract it, and run `oh-my-backup.exe`. To install a stable copy and create desktop/Start menu shortcuts, run `./install.ps1` from the extracted folder in PowerShell. Administrator access is not required. Pin the new shortcut; an old pin can retain Windows' cached icon until replaced.
+Run the self-contained `install.ps1` at the repository root, or extract a release ZIP and run its `install.ps1`. Without a bundled executable, the installer downloads the latest stable release from `ersinkoc/oh-my-backup`. It always installs in `%LOCALAPPDATA%/Programs/OhMyBackup`, without administrator access, and creates desktop/Start menu shortcuts. Rerunning it updates that same folder. Existing startup registration is redirected to the stable executable without enabling startup for new users. Pin the new shortcut; an old pin can retain Windows' cached icon until replaced.
+
+```powershell
+./install.ps1
+# Or install a locally built executable, without a GitHub download:
+./install.ps1 -SourceExe ./target/release/oh-my-backup.exe
+```
+
+Close an already-running installed copy before manual installation. Use `-NoDesktopShortcut`, `-NoStartMenu` or `-Restart` when needed. The legacy `scripts/install.ps1` entry point forwards to the root installer.
+
+## Updates inside the app
+
+Open **Updates**, then **Check for updates**. A newer stable release can be downloaded and verified while backups continue. **Update and restart** is enabled only for the fixed-folder installation when no transfer is active. It shuts down the engine, flushes statistics, exits, replaces the executable and restarts the application. A job that races the restart request is cancelled through its normal checkpoints before exit. Installation preserves settings, credentials and backup destinations.
+
+The updater verifies the SHA-256 checksum, GitHub's asset digest when available, archive paths and the executable's `--version` output. Automatic downgrades, links/junctions, unexpected archive entries and competing installers are rejected. The monotonic version check runs again under the installation lock. Replacement or installed-version verification failures restore the previous EXE; the previous working file is retained as `oh-my-backup.previous.exe`. This rollback covers installation failures, not arbitrary crashes after a successful restart. Explicit manual `-SourceExe` installation can restore an older version. Update results and prepared files stay in `%LOCALAPPDATA%/OhMyBackup/updates`.
+
+For the private repository, use an existing `gh auth login` session or `GH_TOKEN`/`GITHUB_TOKEN`. Alternatively, save a GitHub token with **Contents: read** for this repository in the Updates window. Tokens saved by the app are encrypted with DPAPI and are sent to the helper through standard input, never command-line arguments or temporary request files. No credential is bundled in the installer. A missing or expired credential produces an actionable error. The client requires Windows PowerShell 5.1, included with supported Windows installations.
+
+The network integration uses the official [GitHub Releases asset API](https://docs.github.com/en/rest/releases/assets) and optional [GitHub CLI authentication](https://cli.github.com/manual/gh_auth_token).
+
+`oh-my-backup.exe --check-update` performs a read-only release check without opening the GUI.
 
 Open Settings and enter your server, SSH username/password, remote folder and local backup destination. New installations contain no server credentials and do not start automatic transfers. The SSH server needs Python 3 and a Linux `/proc` filesystem. The local filesystem must support the file operations used by the selected update mode; NTFS is recommended.
 
@@ -33,6 +53,7 @@ The repository pins Rust 1.93.0. Use the Windows MSVC target and Windows SDK res
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+./scripts/test-installer.ps1
 cargo run --locked -- --preview
 ./scripts/package.ps1
 ```
